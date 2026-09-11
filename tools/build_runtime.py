@@ -60,9 +60,6 @@ def get_index(node_ids: np.ndarray, bodies: np.ndarray) -> tuple[np.ndarray, np.
 
 
 def build_edges(node_ids: np.ndarray):
-    # The MaleCNS connectome download is a Feather file. Some published versions are
-    # not directly accepted by pyarrow.ipc.open_file(), so use the supported Feather
-    # reader and iterate Arrow record batches from the resulting table.
     print("Reading connectome Feather columns (body_pre, body_post, weight)...", flush=True)
     table = feather.read_table(
         CONNECTOME,
@@ -74,8 +71,6 @@ def build_edges(node_ids: np.ndarray):
     if names != ["body_pre", "body_post", "weight"]:
         raise RuntimeError(f"Unexpected connectome schema: {names}")
 
-    # Keep batches moderate so the temporary NumPy conversion does not multiply
-    # memory usage on the GitHub runner.
     batches = table.to_batches(max_chunksize=1_000_000)
     pres: list[np.ndarray] = []
     posts: list[np.ndarray] = []
@@ -103,7 +98,6 @@ def build_edges(node_ids: np.ndarray):
         if batch_i == 1 or batch_i % 10 == 0 or batch_i == len(batches):
             print(f"batch {batch_i}/{len(batches)}: raw={raw_rows:,} kept={kept:,}", flush=True)
 
-    # Drop the large Arrow table before the sort/CSR conversion.
     del table, batches
 
     pre = np.concatenate(pres)
@@ -135,6 +129,12 @@ def build_edges(node_ids: np.ndarray):
         weights=weight_sorted.astype(np.float64),
         minlength=node_ids.size,
     ).astype(np.float32)
+    # BrainEngine normalizes every receiver row by this value. Neurons with no
+    # retained incoming edges must use a neutral divisor of 1 rather than 0,
+    # otherwise 0/0 propagates NaNs through the recurrent dynamics.
+    zero_rows = int(np.count_nonzero(row_weight_sum == 0))
+    row_weight_sum[row_weight_sum == 0] = 1.0
+    print(f"CSR rows with no retained incoming edges: {zero_rows:,} (divisor set to 1)", flush=True)
     return col_idx, weight_sorted, row_ptr, row_weight_sum, raw_rows
 
 
@@ -158,6 +158,7 @@ def main() -> None:
         "retained_weight": int(weight.astype(np.uint64).sum()),
         "max_weight": int(weight.max()),
         "csr_semantics": "row=receiver(post), col=sender(pre)",
+        "zero_incoming_row_divisor": 1.0,
     }
     (RUNTIME / "runtime_meta.json").write_text(json.dumps(meta, ensure_ascii=False, indent=2), encoding="utf-8")
     (RUNTIME / "version_v0.7.json").write_text(json.dumps({"game":"FlyBrain Pong","version":"0.7.2"}, indent=2), encoding="utf-8")
