@@ -29,7 +29,7 @@ jobs:
           @'
           import base64, glob, hashlib, pathlib, zipfile
           parts = sorted(glob.glob('assets/source_bundle.part*.b64'))
-          assert len(parts) == 13, f'expected 13 source parts, got {len(parts)}'
+          assert len(parts) == 15, f'expected 15 source fragments, got {len(parts)}: {parts}'
           text = ''.join(pathlib.Path(p).read_text(encoding='utf-8').strip() for p in parts)
           raw = base64.b64decode(text, validate=True)
           sha = hashlib.sha256(raw).hexdigest()
@@ -141,7 +141,7 @@ jobs:
           @'
           # FlyBrain Pong V0.7.2
 
-          Windows 公開下載版。下載單一 EXE 後即可啟動，不需要另外下載 BAT 或 MaleCNS runtime。
+          Windows 公開下載版。下載單一 EXE 後即可啟動，不需要另外下載 BAT、Python 或 MaleCNS runtime。
 
           第一次啟動會將內含的遊戲環境解壓到 `%LOCALAPPDATA%\\FlyBrainPong\\0.7.2`，之後直接啟動。
 
