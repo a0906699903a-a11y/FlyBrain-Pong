@@ -1,0 +1,178 @@
+name: Build public FlyBrain Pong V0.7.2 EXE
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/build-release.yml'
+
+permissions:
+  contents: write
+
+jobs:
+  build-release:
+    runs-on: windows-latest
+    timeout-minutes: 120
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Reconstruct V0.7.2 source bundle
+        shell: powershell
+        run: |
+          @'
+          import base64, glob, hashlib, pathlib, zipfile
+          parts = sorted(glob.glob('assets/source_bundle.part*.b64'))
+          assert len(parts) == 13, f'expected 13 source parts, got {len(parts)}'
+          text = ''.join(pathlib.Path(p).read_text(encoding='utf-8').strip() for p in parts)
+          raw = base64.b64decode(text, validate=True)
+          sha = hashlib.sha256(raw).hexdigest()
+          print('source_bundle sha256:', sha)
+          assert sha == '8b8ed871c1742e43f3719b2fd2aef06d0087fd99b788b346f802a8925695fa7a', sha
+          pathlib.Path('source_bundle.zip').write_bytes(raw)
+          with zipfile.ZipFile('source_bundle.zip') as z:
+              assert z.testzip() is None
+              z.extractall('game')
+          io_raw = base64.b64decode(pathlib.Path('assets/io_map_v0.2.npz.b64').read_text().strip(), validate=True)
+          io_sha = hashlib.sha256(io_raw).hexdigest()
+          print('io_map sha256:', io_sha)
+          assert io_sha == '10edd510f859058460bc4238bd4d28cdf2e33f9338a08ee90f3f5f5fc9bc46b2', io_sha
+          pathlib.Path('io_map_v0.2.npz').write_bytes(io_raw)
+          '@ | Set-Content reconstruct.py -Encoding UTF8
+          python reconstruct.py
+
+      - name: Install build dependencies
+        shell: powershell
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install numpy==2.1.3 scipy==1.14.1 pyarrow==17.0.0 pyinstaller==6.11.1
+
+      - name: Download official Janelia MaleCNS bulk data
+        shell: powershell
+        run: |
+          New-Item -ItemType Directory -Force build_data | Out-Null
+          $base = 'https://storage.googleapis.com/flyem-male-cns/v1.0/connectome-data/flat-connectome'
+          curl.exe -L --fail --retry 5 --retry-delay 5 -o build_data/body-annotations-male-cns-v1.0-minconf-0.5.feather "$base/body-annotations-male-cns-v1.0-minconf-0.5.feather"
+          curl.exe -L --fail --retry 5 --retry-delay 5 -o build_data/connectome-weights-male-cns-v1.0-minconf-0.5.feather "$base/connectome-weights-male-cns-v1.0-minconf-0.5.feather"
+          Get-Item build_data/*.feather | Format-Table Name,Length
+
+      - name: Build fixed MaleCNS runtime
+        shell: powershell
+        run: |
+          python tools/build_runtime.py
+          Copy-Item io_map_v0.2.npz runtime/io_map_v0.2.npz -Force
+          Copy-Item -Recurse runtime game/runtime -Force
+
+      - name: Validate scientific runtime and game
+        shell: powershell
+        run: |
+          Push-Location game
+          python self_test_v07.py
+          python roguelike_self_test_v07.py
+          Pop-Location
+
+      - name: Build bundled Windows application
+        shell: powershell
+        run: |
+          python -m PyInstaller --noconfirm --clean --windowed `
+            --name FlyBrainPongApp `
+            --paths game `
+            --distpath dist `
+            --workpath build/pyinstaller `
+            --specpath build/spec `
+            --hidden-import self_train_v07 `
+            --hidden-import strategy_train_v07 `
+            --hidden-import aggression_train_v07 `
+            --add-data "game/runtime;runtime" `
+            --add-data "game/strategy_state_v0.7.json;." `
+            --add-data "game/strategy_training_meta_v0.7.json;." `
+            game/pong_flybrain.py
+          if (!(Test-Path dist/FlyBrainPongApp/FlyBrainPongApp.exe)) { throw 'Bundled game EXE missing' }
+
+      - name: Package persistent payload
+        shell: powershell
+        run: |
+          if (Test-Path payload.zip) { Remove-Item payload.zip -Force }
+          Compress-Archive -Path dist/FlyBrainPongApp -DestinationPath payload.zip -CompressionLevel Optimal
+          Get-Item payload.zip | Format-List Name,Length
+
+      - name: Compile self-extracting launcher
+        uses: ilammy/msvc-dev-cmd@v1
+
+      - name: Build final single EXE
+        shell: powershell
+        run: |
+          cl /nologo /std:c++17 /EHsc /O2 /MT /DUNICODE /D_UNICODE tools/sfx_launcher.cpp user32.lib /link /SUBSYSTEM:WINDOWS /OUT:FlyBrainPongStub.exe
+          @'
+          import hashlib, pathlib, struct, zipfile, io
+          stub = pathlib.Path('FlyBrainPongStub.exe').read_bytes()
+          payload = pathlib.Path('payload.zip').read_bytes()
+          footer = b'FBP0722!' + struct.pack('<QQ', len(stub), len(payload))
+          out = pathlib.Path('FlyBrainPong_V0.7.2_Complete.exe')
+          out.write_bytes(stub + payload + footer)
+          assert out.read_bytes()[:2] == b'MZ'
+          data = out.read_bytes()
+          magic = data[-24:-16]
+          offset, length = struct.unpack('<QQ', data[-16:])
+          assert magic == b'FBP0722!'
+          assert offset + length + 24 == len(data)
+          with zipfile.ZipFile(io.BytesIO(data[offset:offset+length])) as z:
+              assert z.testzip() is None
+              assert 'FlyBrainPongApp/FlyBrainPongApp.exe' in z.namelist()
+          sha = hashlib.sha256(data).hexdigest()
+          pathlib.Path('FlyBrainPong_V0.7.2_Complete.sha256.txt').write_text(f'{sha}  FlyBrainPong_V0.7.2_Complete.exe\n', encoding='ascii')
+          print('FINAL SIZE:', len(data))
+          print('FINAL SHA256:', sha)
+          '@ | Set-Content finalize.py -Encoding UTF8
+          python finalize.py
+
+      - name: Prepare release notes
+        shell: powershell
+        run: |
+          New-Item -ItemType Directory -Force release | Out-Null
+          Copy-Item FlyBrainPong_V0.7.2_Complete.exe release/ -Force
+          Copy-Item FlyBrainPong_V0.7.2_Complete.sha256.txt release/ -Force
+          @'
+          # FlyBrain Pong V0.7.2
+
+          Windows 公開下載版。下載單一 EXE 後即可啟動，不需要另外下載 BAT 或 MaleCNS runtime。
+
+          第一次啟動會將內含的遊戲環境解壓到 `%LOCALAPPDATA%\\FlyBrainPong\\0.7.2`，之後直接啟動。
+
+          - Janelia MaleCNS v1.0 fixed connectome backbone
+          - 165,122 traced neurons
+          - 25,563,197 retained directed weighted edges
+          - Classic / Roguelike Pong
+          - in-game Motor / Strategy / Aggressive training
+          - freely selectable training rounds
+          - cards, synergies, counters and build pivoting
+
+          Scientific note: this is a controller built around measured connectome wiring/dynamics. It is not evidence that a biological fruit fly literally understands Pong.
+
+          Dataset attribution: HHMI Janelia FlyEM / MaleCNS v1.0, CC-BY. See the repository README and `DATASET_ATTRIBUTION.txt` inside the game package.
+          '@ | Set-Content release_notes.md -Encoding UTF8
+
+      - name: Publish GitHub Release
+        shell: powershell
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release delete v0.7.2 --cleanup-tag --yes 2>$null
+          gh release create v0.7.2 `
+            release/FlyBrainPong_V0.7.2_Complete.exe `
+            release/FlyBrainPong_V0.7.2_Complete.sha256.txt `
+            --title "FlyBrain Pong V0.7.2" `
+            --notes-file release_notes.md `
+            --latest
+
+      - name: Release summary
+        shell: powershell
+        run: |
+          Get-Item release/FlyBrainPong_V0.7.2_Complete.exe | Format-List Name,Length
+          Get-Content release/FlyBrainPong_V0.7.2_Complete.sha256.txt
