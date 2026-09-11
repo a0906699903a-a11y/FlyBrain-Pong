@@ -4,8 +4,6 @@ import json
 from pathlib import Path
 
 import numpy as np
-import pyarrow as pa
-import pyarrow.ipc as ipc
 import pyarrow.feather as feather
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -26,13 +24,10 @@ def _pick_column(names: list[str], candidates: tuple[str, ...], label: str) -> s
     for cand in candidates:
         if cand.lower() in lower:
             return lower[cand.lower()]
-    raise RuntimeError(f"Could not find {label} column. Available annotation columns: {names}")
+    raise RuntimeError(f"Could not find {label} column. Available columns: {names}")
 
 
 def load_traced_ids() -> np.ndarray:
-    # MaleCNS flat annotation exports use bodyid (not the neuPrint-style bodyId/body
-    # spelling used by some APIs). Read schema first so the public builder is robust
-    # to harmless naming/case changes between export tooling versions.
     schema = feather.read_table(ANNOT, memory_map=True).schema
     names = schema.names
     body_col = _pick_column(names, ("bodyid", "bodyId", "body", "id"), "body ID")
@@ -45,7 +40,6 @@ def load_traced_ids() -> np.ndarray:
     mask = np.fromiter((str(x).strip().lower() == "traced" for x in status), dtype=bool, count=len(status))
     node_ids = np.sort(np.asarray(body[mask], dtype=np.int64))
     if node_ids.size != EXPECTED_NEURONS:
-        # Print status counts before failing; this makes future public-data schema changes diagnosable.
         from collections import Counter
         counts = Counter(str(x) for x in status)
         raise RuntimeError(
@@ -66,45 +60,57 @@ def get_index(node_ids: np.ndarray, bodies: np.ndarray) -> tuple[np.ndarray, np.
 
 
 def build_edges(node_ids: np.ndarray):
-    source = pa.memory_map(str(CONNECTOME), "r")
-    reader = ipc.open_file(source)
-    schema = reader.schema
-    ipre = schema.get_field_index("body_pre")
-    ipost = schema.get_field_index("body_post")
-    iw = schema.get_field_index("weight")
-    if min(ipre, ipost, iw) < 0:
-        raise RuntimeError(f"Unexpected connectome schema: {schema.names}")
+    # The MaleCNS connectome download is a Feather file. Some published versions are
+    # not directly accepted by pyarrow.ipc.open_file(), so use the supported Feather
+    # reader and iterate Arrow record batches from the resulting table.
+    print("Reading connectome Feather columns (body_pre, body_post, weight)...", flush=True)
+    table = feather.read_table(
+        CONNECTOME,
+        columns=["body_pre", "body_post", "weight"],
+        memory_map=True,
+        use_threads=True,
+    )
+    names = table.schema.names
+    if names != ["body_pre", "body_post", "weight"]:
+        raise RuntimeError(f"Unexpected connectome schema: {names}")
 
+    # Keep batches moderate so the temporary NumPy conversion does not multiply
+    # memory usage on the GitHub runner.
+    batches = table.to_batches(max_chunksize=1_000_000)
     pres: list[np.ndarray] = []
     posts: list[np.ndarray] = []
     weights: list[np.ndarray] = []
     raw_rows = 0
     kept = 0
 
-    for batch_i in range(reader.num_record_batches):
-        batch = reader.get_batch(batch_i)
-        pre_body = np.asarray(batch.column(ipre).to_numpy(zero_copy_only=False), dtype=np.int64)
-        post_body = np.asarray(batch.column(ipost).to_numpy(zero_copy_only=False), dtype=np.int64)
-        w = np.asarray(batch.column(iw).to_numpy(zero_copy_only=False))
+    for batch_i, batch in enumerate(batches, start=1):
+        pre_body = np.asarray(batch.column(0).to_numpy(zero_copy_only=False), dtype=np.int64)
+        post_body = np.asarray(batch.column(1).to_numpy(zero_copy_only=False), dtype=np.int64)
+        w = np.asarray(batch.column(2).to_numpy(zero_copy_only=False))
         raw_rows += len(w)
 
         pre_idx, vpre = get_index(node_ids, pre_body)
         post_idx, vpost = get_index(node_ids, post_body)
         valid = vpre & vpost
-        if not np.any(valid):
-            continue
-        p = pre_idx[valid].astype(np.int32, copy=False)
-        q = post_idx[valid].astype(np.int32, copy=False)
-        ww = w[valid].astype(np.uint16, copy=False)
-        pres.append(p.copy())
-        posts.append(q.copy())
-        weights.append(ww.copy())
-        kept += len(ww)
-        print(f"batch {batch_i+1}/{reader.num_record_batches}: raw={raw_rows:,} kept={kept:,}", flush=True)
+        if np.any(valid):
+            p = pre_idx[valid].astype(np.int32, copy=False)
+            q = post_idx[valid].astype(np.int32, copy=False)
+            ww = w[valid].astype(np.uint16, copy=False)
+            pres.append(p.copy())
+            posts.append(q.copy())
+            weights.append(ww.copy())
+            kept += len(ww)
+        if batch_i == 1 or batch_i % 10 == 0 or batch_i == len(batches):
+            print(f"batch {batch_i}/{len(batches)}: raw={raw_rows:,} kept={kept:,}", flush=True)
+
+    # Drop the large Arrow table before the sort/CSR conversion.
+    del table, batches
 
     pre = np.concatenate(pres)
     post = np.concatenate(posts)
     weight = np.concatenate(weights)
+    del pres, posts, weights
+
     if len(weight) != EXPECTED_EDGES:
         raise RuntimeError(f"Unexpected retained edge count: {len(weight):,} != {EXPECTED_EDGES:,}")
     total_weight = int(weight.astype(np.uint64).sum())
