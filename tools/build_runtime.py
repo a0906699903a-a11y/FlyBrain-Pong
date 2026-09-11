@@ -21,14 +21,37 @@ EXPECTED_WEIGHT_SUM = 124_025_046
 EXPECTED_MAX_WEIGHT = 2_591
 
 
+def _pick_column(names: list[str], candidates: tuple[str, ...], label: str) -> str:
+    lower = {name.lower(): name for name in names}
+    for cand in candidates:
+        if cand.lower() in lower:
+            return lower[cand.lower()]
+    raise RuntimeError(f"Could not find {label} column. Available annotation columns: {names}")
+
+
 def load_traced_ids() -> np.ndarray:
-    table = feather.read_table(ANNOT, columns=["body", "status"], memory_map=True)
-    body = table.column("body").to_numpy(zero_copy_only=False)
-    status = table.column("status").to_pylist()
-    mask = np.fromiter((x == "Traced" for x in status), dtype=bool, count=len(status))
+    # MaleCNS flat annotation exports use bodyid (not the neuPrint-style bodyId/body
+    # spelling used by some APIs). Read schema first so the public builder is robust
+    # to harmless naming/case changes between export tooling versions.
+    schema = feather.read_table(ANNOT, memory_map=True).schema
+    names = schema.names
+    body_col = _pick_column(names, ("bodyid", "bodyId", "body", "id"), "body ID")
+    status_col = _pick_column(names, ("status", "statusLabel", "status_label"), "status")
+    print(f"Annotation columns: body={body_col!r} status={status_col!r}", flush=True)
+
+    table = feather.read_table(ANNOT, columns=[body_col, status_col], memory_map=True)
+    body = table.column(body_col).to_numpy(zero_copy_only=False)
+    status = table.column(status_col).to_pylist()
+    mask = np.fromiter((str(x).strip().lower() == "traced" for x in status), dtype=bool, count=len(status))
     node_ids = np.sort(np.asarray(body[mask], dtype=np.int64))
     if node_ids.size != EXPECTED_NEURONS:
-        raise RuntimeError(f"Unexpected traced neuron count: {node_ids.size:,} != {EXPECTED_NEURONS:,}")
+        # Print status counts before failing; this makes future public-data schema changes diagnosable.
+        from collections import Counter
+        counts = Counter(str(x) for x in status)
+        raise RuntimeError(
+            f"Unexpected traced neuron count: {node_ids.size:,} != {EXPECTED_NEURONS:,}. "
+            f"Status counts: {counts.most_common(12)}"
+        )
     if np.unique(node_ids).size != node_ids.size:
         raise RuntimeError("Duplicate traced body IDs detected")
     return node_ids
